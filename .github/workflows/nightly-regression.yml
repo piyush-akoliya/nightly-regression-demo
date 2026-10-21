@@ -1,0 +1,125 @@
+name: Nightly Regression
+
+on:
+  schedule:
+    # GitHub cron is UTC-only. Two entries cover 11pm US Eastern all year;
+    # the "gate" job lets only the one that lands on 23:xx New York time proceed.
+    - cron: '0 3 * * *'   # 11pm EDT (summer)
+    - cron: '0 4 * * *'   # 11pm EST (winter)
+  workflow_dispatch:
+    inputs:
+      send_email:
+        description: 'Send report emails'
+        type: boolean
+        default: true
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    outputs:
+      run: ${{ steps.check.outputs.run }}
+    steps:
+      - id: check
+        run: |
+          if [ "${{ github.event_name }}" != "schedule" ]; then
+            echo "Manual run - proceeding"
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          hour=$(TZ=America/New_York date +%H)
+          echo "Current New York hour: $hour"
+          if [ "$hour" = "23" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Not 11pm in New York - skipping this trigger"
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  regression:
+    needs: gate
+    if: needs.gate.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # Every malcode x every environment = 6 parallel jobs.
+        # To add a malcode or environment, add it to these lists and create the matching environment_<MALCODE>_<ENV>.properties files.
+        malcode: [MAL001, MAL002, MAL003]
+        env_name: [SIT, PAT]
+    name: ${{ matrix.malcode }} / ${{ matrix.env_name }}
+    env:
+      RUN_NAME: ${{ matrix.malcode }}-${{ matrix.env_name }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+
+      # Overwrite the "env" field in tcoe.properties (e.g. env=MAL001_SIT) so the framework
+      # loads environment_MAL001_SIT.properties for this job.
+      - name: Set tcoe.properties for ${{ matrix.malcode }} / ${{ matrix.env_name }}
+        run: |
+          bash scripts/set-env.sh "${{ matrix.malcode }}" "${{ matrix.env_name }}"
+          echo "--- tcoe.properties now contains ---"
+          cat src/test/resources/tcoe.properties
+
+      # Chrome is pre-installed on ubuntu runners; Selenium Manager fetches the driver.
+      - name: Run regression
+        run: >
+          mvn -B verify
+          -Dmaven.test.failure.ignore=true
+          -Dcucumber.filter.tags=@${{ matrix.malcode }}
+          -Dreport.name=${{ env.RUN_NAME }}
+          -Dbuild.number=${{ github.run_number }}
+
+      - name: Summarize results
+        id: summary
+        if: always()
+        run: |
+          bash scripts/summarize.sh "target/cucumber-reports/${RUN_NAME}/cucumber.json" >> "$GITHUB_OUTPUT"
+          echo "date=$(TZ=America/New_York date +%F)" >> "$GITHUB_OUTPUT"
+          cat "$GITHUB_OUTPUT"
+
+      - name: Upload full report artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: report-${{ env.RUN_NAME }}
+          path: target/cucumber-html-reports/${{ env.RUN_NAME }}
+          retention-days: 30
+
+      - name: Email report
+        if: always() && (github.event_name == 'schedule' || inputs.send_email)
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: ${{ secrets.SMTP_SERVER }}
+          server_port: ${{ secrets.SMTP_PORT }}
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          from: ${{ secrets.MAIL_FROM }}
+          to: ${{ vars[format('{0}_RECIPIENTS', matrix.malcode)] || vars.DEFAULT_RECIPIENTS }}
+          subject: "[${{ steps.summary.outputs.status }}] ${{ matrix.malcode }} ${{ matrix.env_name }} nightly regression - ${{ steps.summary.outputs.date }}"
+          html_body: |
+            <h3>${{ matrix.malcode }} (${{ matrix.env_name }}) - nightly regression: ${{ steps.summary.outputs.status }}</h3>
+            <table border="1" cellpadding="6" cellspacing="0">
+              <tr><td>Total scenarios</td><td>${{ steps.summary.outputs.total }}</td></tr>
+              <tr><td>Passed</td><td>${{ steps.summary.outputs.passed }}</td></tr>
+              <tr><td>Failed</td><td>${{ steps.summary.outputs.failed }}</td></tr>
+            </table>
+            <p>The Cucumber report is attached as a single HTML file. Open it in your browser.</p>
+            <p><a href="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}">View the workflow run</a></p>
+          attachments: target/cucumber-reports/${{ env.RUN_NAME }}/${{ env.RUN_NAME }}-report.html
+
+      # Email is already sent; now make the job red if anything failed.
+      - name: Fail job if tests failed
+        if: always()
+        run: |
+          if [ "${{ steps.summary.outputs.status }}" != "PASSED" ]; then
+            echo "Regression status: ${{ steps.summary.outputs.status }}"
+            exit 1
+          fi
